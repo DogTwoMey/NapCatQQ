@@ -37,6 +37,7 @@ import { OidbSvcTrpcTcpBase, OidbSvcTrpcTcp0XCDE_2RespBody } from '@/napcat-core
 import { loadNapcatConfig } from '@/napcat-core/helper/config';
 import { logSubscription, LogWrapper } from '@/napcat-core/helper/log';
 import { proxiedListenerOf } from '@/napcat-core/helper/proxy-handler';
+import { createOfflineRecovery } from '@/napcat-core/helper/offline-recovery';
 import { QQBasicInfoWrapper } from '@/napcat-core/helper/qq-basic-info';
 import { statusHelperSubscription } from '@/napcat-core/helper/status';
 import { applyPendingUpdates } from '@/napcat-webui-backend/src/api/UpdateNapCat';
@@ -839,36 +840,39 @@ export class NapCatShell {
     //   }
     // }
 
-    // 监听下线通知并同步到 WebUI
-    let restartRequested = false;
-    this.core.event.on('KickedOffLine', (tips: string) => {
-      WebUiDataRuntime.setQQLoginStatus(false);
-      // 被踢后的二维码已失效，绝不能继续交给页面展示或扫码。
-      WebUiDataRuntime.setQQLoginQrcodeURL('');
-      WebUiDataRuntime.setQQLoginError(tips);
-      WebUiDataRuntime.setQQLoginPhase('reconnecting');
-
-      if (restartRequested) return;
-      restartRequested = true;
-      // 不从 RefreshQRcode 请求中重启 Worker；否则请求会在返回前被中断，
-      // 浏览器只能得到 ERR_EMPTY_RESPONSE。KickedOffLine 是独立事件，
-      // 在此异步调度可让前端先观察到“二维码已清空、正在恢复”的状态。
-      setTimeout(() => {
-        WebUiDataRuntime.requestRestartProcess().then((restartResult) => {
-          this.context.logger.logWarn('[Core] [Login] 账号被踢下线，正在重启 Worker 以重新创建 QQ 登录服务', restartResult);
-          if (!restartResult.result) {
-            restartRequested = false;
-            WebUiDataRuntime.setQQLoginPhase('offline');
-            WebUiDataRuntime.setQQLoginError(`${tips}\n登录服务重启失败：${restartResult.message}`);
-          }
-        }).catch((error) => {
-          restartRequested = false;
+    // 监听下线并同步到 WebUI
+    // KickedOffLine：账号被踢下线；SelfOffline：静默离线（服务端会话语义失效但无通知）。
+    // 两者复用同一条恢复链路：同步 WebUI -> 重启 Worker -> 快速登录。
+    const handleOffline = createOfflineRecovery({
+      isOnline: () => this.core.selfInfo.online === true,
+      onOffline: (tips) => {
+        WebUiDataRuntime.setQQLoginStatus(false);
+        // 下线后的二维码已失效，绝不能继续交给页面展示或扫码。
+        WebUiDataRuntime.setQQLoginQrcodeURL('');
+        WebUiDataRuntime.setQQLoginError(tips);
+        WebUiDataRuntime.setQQLoginPhase('reconnecting');
+      },
+      onRecovered: () => {
+        WebUiDataRuntime.setQQLoginStatus(true);
+        WebUiDataRuntime.setQQLoginError('');
+        WebUiDataRuntime.setQQLoginPhase('ready');
+      },
+      restart: async (tips) => {
+        try {
+          const restartResult = await WebUiDataRuntime.requestRestartProcess();
+          this.context.logger.logWarn('[Core] [Login] 账号已离线，正在重启 Worker 以重新创建 QQ 登录服务', restartResult);
+          if (restartResult.result) return true;
+          WebUiDataRuntime.setQQLoginPhase('offline');
+          WebUiDataRuntime.setQQLoginError(`${tips}\n登录服务重启失败：${restartResult.message}`);
+        } catch (error) {
           WebUiDataRuntime.setQQLoginPhase('offline');
           WebUiDataRuntime.setQQLoginError(`${tips}\n登录服务重启失败：${(error as Error).message}`);
-        });
-      // 常规状态轮询为 3 秒；留出一个轮询周期，确保浏览器先清除旧二维码。
-      }, 3_500);
+        }
+        return false;
+      },
     });
+    this.core.event.on('KickedOffLine', (tips: string) => handleOffline(tips, false));
+    this.core.event.on('SelfOffline', (tips: string) => handleOffline(tips, true));
     // 使用 NapCatAdapterManager 统一管理协议适配器
     const adapterManager = new NapCatAdapterManager(this.core, this.context, this.context.pathWrapper);
     await adapterManager.initAdapters()
